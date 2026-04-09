@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.coretex.aos-organ.arbiter</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Library/AI/AI-AOS/AOS-organ-dev/AOS-organ-arbiter/AOS-organ-arbiter-src/server/index.js</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NODE_ENV</key>
+        <string>development</string>
+        <key>ARBITER_PORT</key>
+        <string>4021</string>
+        <key>SPINE_URL</key>
+        <string>http://127.0.0.1:4000</string>
+        <key>GRAPH_URL</key>
+        <string>http://127.0.0.1:4020</string>
+        <key>VAULT_ROOT</key>
+        <string>/Library/AI/AI-Infra-MDvaults/MDvault-LLM-Ops</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/Library/AI/AI-AOS/AOS-organ-dev/AOS-organ-arbiter/AOS-organ-arbiter-src</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Library/AI/AI-Infra-MDvaults/MDvault-LLM-Ops/210-Log/arbiter-logs/arbiter-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/AI/AI-Infra-MDvaults/MDvault-LLM-Ops/210-Log/arbiter-logs/arbiter-stderr.log</string>
+</dict>
+</plist>

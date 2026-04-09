@@ -1,0 +1,16 @@
+{
+  "name": "@coretex/organ-arbiter",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Arbiter organ (#190) — Bill of Rights perimeter oracle",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@coretex/organ-boot": "file:../../organ-shared-lib",
+    "express": "^5.1.0"
+  }
+}
