@@ -14,6 +14,7 @@
  */
 
 import { createOrgan } from '@coretex/organ-boot';
+import { stat } from 'node:fs/promises';
 import config from './config.js';
 import { loadBoR } from '../lib/bor-loader.js';
 import { registerBorVersion, verifyBorHash } from '../lib/graph-adapter.js';
@@ -37,7 +38,16 @@ let borState = { loaded: false, version: null, hash: null };
 
 try {
   const bor = await loadBoR(config.borPath);
-  borState = { loaded: true, version: bor.version, hash: bor.hash, clauseCount: bor.clauseCount };
+  const fileStat = await stat(config.borPath);
+  borState = {
+    loaded: true,
+    version: bor.version,
+    hash: bor.hash,
+    clauseCount: bor.clauseCount,
+    raw: bor.raw,
+    effectiveSince: fileStat.mtime.toISOString(),
+    loadedAt: new Date().toISOString(),
+  };
   log('bor_loaded', { version: bor.version, hash: bor.hash, clause_count: bor.clauseCount });
 
   // Verify or register hash with Graph
@@ -105,7 +115,7 @@ const organ = await createOrgan({
 
   routes: (app) => {
     app.use(createScopeRoutes({ config, determinationStore, evaluateScope }));
-    app.use(createBorRoutes({ config }));
+    app.use(createBorRoutes({ config, borState }));
     app.use(createHumanRoutes({ config, escalationStore }));
     app.use(createAmendmentRoutes({ config, escalationStore, draftStore }));
   },
@@ -119,18 +129,23 @@ const organ = await createOrgan({
 
     switch (eventType) {
       case 'bor_updated': {
-        // BoR document has been modified — reload and re-verify
+        // BoR document has been modified — reload and re-verify.
+        // Mutate borState in place so the router's captured reference stays valid.
         log('bor_update_notification', { source: envelope.source_organ });
         try {
           const bor = await loadBoR(config.borPath);
+          const fileStat = await stat(config.borPath);
           const verification = await verifyBorHash(config.graphUrl, bor.hash);
-          borState = {
+          Object.assign(borState, {
             loaded: true,
             version: bor.version,
             hash: bor.hash,
             clauseCount: bor.clauseCount,
+            raw: bor.raw,
+            effectiveSince: fileStat.mtime.toISOString(),
+            loadedAt: new Date().toISOString(),
             degraded: verification.mismatch,
-          };
+          });
           log('bor_reloaded', { version: bor.version, hash_verified: !verification.mismatch });
         } catch (err) {
           log('bor_reload_failed', { error: err.message });

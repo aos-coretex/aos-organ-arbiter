@@ -35,6 +35,14 @@ Only Nomos and the Human Principal may query Arbiter.
 BoR document: `00-Registry/constitutional-policy/bill-of-rights.md`
 Test fixture: `test/fixtures/test-bor.md`
 
+## Routes
+
+Full route list in `server/routes/`. Recently added:
+
+| Path | Method | Purpose |
+|---|---|---|
+| /bor/raw | GET | BoR raw text + metadata (constitutional context for Cortex) |
+
 ## Running
 
 ```bash
