@@ -14,14 +14,19 @@
  */
 
 import { createOrgan } from '@coretex/organ-boot';
+import { createGraphClient } from '@coretex/organ-boot/graph-client';
+import { createLoader } from '@coretex/organ-boot/llm-settings-loader';
+import { initializeUsageAttribution } from '@coretex/organ-boot/usage-attribution';
 import { stat } from 'node:fs/promises';
 import config from './config.js';
-import { loadBoR } from '../lib/bor-loader.js';
+import { loadBoR, createGovernanceLoaders } from '../lib/bor-loader.js';
 import { registerBorVersion, verifyBorHash } from '../lib/graph-adapter.js';
 import { createClauseMatcher } from '../agents/clause-matcher.js';
+import { matchConstitutional, matchScope } from '../agents/governance-matchers.js';
 import { createDeterminationStore } from '../lib/determination-store.js';
 import { createAmbiguityTracker } from '../lib/ambiguity-tracker.js';
 import { createScopeRoutes } from './routes/scope.js';
+import { createConstitutionalCheckRoutes } from './routes/constitutional-check.js';
 import { createBorRoutes } from './routes/bor.js';
 import { createHumanRoutes, createEscalationStore } from './routes/human.js';
 import { createAmendmentRoutes, createDraftStore } from './routes/amendments.js';
@@ -51,7 +56,7 @@ try {
   log('bor_loaded', { version: bor.version, hash: bor.hash, clause_count: bor.clauseCount });
 
   // Verify or register hash with Graph
-  const verification = await verifyBorHash(config.graphUrl, bor.hash);
+  const verification = await verifyBorHash(config.graphUrl, bor.version, bor.hash);
   if (verification.registered === null) {
     // First boot or no registered version — register current hash
     const urn = await registerBorVersion(config.graphUrl, {
@@ -75,26 +80,63 @@ try {
   borState.degraded = true;
 }
 
+// --- LLM settings loader (MP-CONFIG-1 R5 migration — l9m-5) ---
+
+const llmLoader = createLoader({
+  organNumber: 190,
+  organName: 'arbiter',
+  settingsRoot: config.settingsRoot,
+});
+
+function buildLlmClient(agentName) {
+  const { config: resolved, chat } = llmLoader.resolveWithCascade(agentName);
+  const apiKeyEnv = resolved.apiKeyEnvVar || 'ANTHROPIC_API_KEY';
+  return {
+    chat,
+    isAvailable: () => Boolean(process.env[apiKeyEnv]),
+    getUsage: () => ({ agent: resolved.agentName, model: resolved.defaultModel, provider: resolved.defaultProvider }),
+  };
+}
+
+// MP-CONFIG-1 R9 — register the process-default usage writer so every
+// cascade-wrapped `llm.chat()` emits a flat `llm_usage_event` concept
+// into Graph, bound to the tenant entity (infrastructure-exempt audit).
+initializeUsageAttribution({ organName: 'Arbiter', graphUrl: config.graphUrl });
+
 // --- Create components ---
 
-const clauseMatcher = createClauseMatcher(config);
+const clauseMatcher = createClauseMatcher(config, buildLlmClient('clause-matcher'));
 const determinationStore = createDeterminationStore();
 const escalationStore = createEscalationStore();
 const draftStore = createDraftStore();
 const ambiguityTracker = createAmbiguityTracker({ threshold: 3 });
 
-// Wrap evaluateScope to also record AMBIGUOUS patterns
-async function evaluateScope(params) {
-  const result = await clauseMatcher.evaluate(params);
+// Graph-backed governance loaders (MP-17).
+const graphClient = createGraphClient({ baseUrl: config.graphUrl, organName: 'Arbiter' });
+const governanceLoaders = createGovernanceLoaders({ graphClient, ttlMs: 60_000 });
 
-  if (result.determination === 'AMBIGUOUS') {
+// Matcher wrappers with ambiguity tracking preserved for AMBIGUOUS / INDETERMINATE.
+async function wrappedMatchConstitutional(params) {
+  const result = await matchConstitutional({ ...params, clauseMatcher });
+  if (result.verdict === 'INDETERMINATE') {
     ambiguityTracker.record({
       action: params.action,
-      ap_ref: params.ap_ref || 'unknown',
-      cited_clauses: result.cited_clauses,
+      ap_ref: 'constitutional-check',
+      cited_clauses: result.matched_rules.map((id) => ({ clause_id: id })),
     });
   }
+  return result;
+}
 
+async function wrappedMatchScope(params) {
+  const result = await matchScope({ ...params, clauseMatcher });
+  if (result.verdict === 'AMBIGUOUS') {
+    ambiguityTracker.record({
+      action: params.action,
+      ap_ref: 'scope-query',
+      cited_clauses: result.matched_rules.map((id) => ({ clause_id: id })),
+    });
+  }
   return result;
 }
 
@@ -114,7 +156,16 @@ const organ = await createOrgan({
   dependencies: ['Spine', 'Graph'],
 
   routes: (app) => {
-    app.use(createScopeRoutes({ config, determinationStore, evaluateScope }));
+    app.use(createScopeRoutes({
+      governanceLoaders,
+      determinationStore,
+      matchConstitutional: wrappedMatchConstitutional,
+      matchScope: wrappedMatchScope,
+    }));
+    app.use(createConstitutionalCheckRoutes({
+      governanceLoaders,
+      matchConstitutional: wrappedMatchConstitutional,
+    }));
     app.use(createBorRoutes({ config, borState }));
     app.use(createHumanRoutes({ config, escalationStore }));
     app.use(createAmendmentRoutes({ config, escalationStore, draftStore }));
@@ -135,7 +186,7 @@ const organ = await createOrgan({
         try {
           const bor = await loadBoR(config.borPath);
           const fileStat = await stat(config.borPath);
-          const verification = await verifyBorHash(config.graphUrl, bor.hash);
+          const verification = await verifyBorHash(config.graphUrl, bor.version, bor.hash);
           Object.assign(borState, {
             loaded: true,
             version: bor.version,
@@ -161,6 +212,15 @@ const organ = await createOrgan({
         break;
       }
 
+      case 'governance_updated': {
+        // MP-17: Senate broadcasts after publishing Constitution / entity BoR / MSP / statute.
+        // Invalidate the corresponding cache entry so the next query reads fresh from Graph.
+        const urn = envelope.payload?.data?.urn || envelope.payload?.urn;
+        log('governance_updated_received', { source: envelope.source_organ, urn });
+        governanceLoaders.invalidate(urn);
+        break;
+      }
+
       default:
         break;
     }
@@ -169,6 +229,7 @@ const organ = await createOrgan({
   subscriptions: [
     { event_type: 'bor_updated' },
     { event_type: 'governance_notification' },
+    { event_type: 'governance_updated' },
   ],
 
   healthCheck: async () => ({
@@ -189,6 +250,8 @@ const organ = await createOrgan({
       ambiguity_rate: detStats.ambiguity_rate,
       amendment_drafts: draftStats.total_drafts,
       ambiguity_patterns: ambStats.tracked_patterns,
+      // MP-CONFIG-1 R5 — flat per bug #9; consumed by Axon aggregator R8.
+      llm: llmLoader.introspect(),
     };
   },
 

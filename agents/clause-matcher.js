@@ -11,10 +11,11 @@
  *   - Three-way output ONLY — no gradients, no partial scope
  *   - When LLM cannot confidently match a clause → AMBIGUOUS
  *
- * Model: Haiku (lightweight, fast) via llm-client from organ-shared-lib.
+ * Model: resolved by `@coretex/organ-boot/llm-settings-loader` from
+ * `01-Organs/190-Arbiter/arbiter-organ-clause-matcher-llm-settings.yaml`.
+ * Boot path constructs the loader + cascade-wrapped client and injects it.
+ * (MP-CONFIG-1 R5 migration — l9m-5.)
  */
-
-import { createLLMClient } from '@coretex/organ-boot/llm-client';
 
 function log(event, data = {}) {
   const entry = { timestamp: new Date().toISOString(), event, ...data };
@@ -57,18 +58,20 @@ Output ONLY the JSON object. No markdown, no preamble.`;
 /**
  * Create a clause matcher instance.
  *
- * @param {object} config - organ config (config.llm for model settings)
- * @param {object} [injectedLlm] - optional pre-built LLM client (for testing)
+ * @param {object} config - organ config (no longer used for LLM settings; retained for forward extensibility)
+ * @param {object} llm - LLM client; required. Boot path injects a loader-derived
+ *                       cascade-wrapped client; tests inject `{chat, isAvailable, getUsage}` mocks.
  * @returns {{ evaluate: function, isAvailable: function }}
  */
-export function createClauseMatcher(config, injectedLlm) {
-  const llm = injectedLlm || createLLMClient({
-    agentName: 'clause_matcher',
-    defaultModel: config.llm?.model || 'claude-haiku-4-5-20251001',
-    defaultProvider: config.llm?.provider || 'anthropic',
-    apiKeyEnvVar: config.llm?.apiKeyEnvVar || 'ANTHROPIC_API_KEY',
-    maxTokens: config.llm?.maxTokens || 2048,
-  });
+export function createClauseMatcher(config, llmArg) {
+  // Boot path injects a loader-derived cascade-wrapped client. Tests inject mocks.
+  // If neither, fall through to an "unavailable" stub — production boot wires
+  // the real one; tests that don't exercise the LLM path still construct.
+  const llm = llmArg || {
+    chat: async () => { throw new Error('Arbiter clause-matcher: no LLM client wired; boot path must inject one (MP-CONFIG-1 R5)'); },
+    isAvailable: () => false,
+    getUsage: () => ({}),
+  };
 
   /**
    * Evaluate scope for a proposed action against the BoR.

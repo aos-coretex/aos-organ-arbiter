@@ -20,13 +20,10 @@ export default {
     || `${vaultRoot}/00-Registry/constitutional-policy/bill-of-rights.md`,
   vaultRoot,
 
-  // LLM configuration for clause matching agent
-  llm: {
-    model: process.env.ARBITER_MODEL || 'claude-haiku-4-5-20251001',
-    provider: 'anthropic',
-    apiKeyEnvVar: 'ANTHROPIC_API_KEY',
-    maxTokens: 2048,
-  },
+  // LLM settings root (consumed by `@coretex/organ-boot/llm-settings-loader`).
+  // The loader reads `<settingsRoot>/190-Arbiter/arbiter-organ-{default,clause-matcher}-llm-settings.yaml`.
+  // No hardcoded model strings — settings YAML is the source of truth (MP-CONFIG-1 R5).
+  settingsRoot: process.env.SETTINGS_ROOT || `${vaultRoot}/01-Organs`,
 
   env,
 };

@@ -1,126 +1,192 @@
 /**
- * Scope query routes — the core Arbiter API.
+ * Scope query routes — MP-17 two-tier scope check.
  *
- * POST /scope-query  — evaluate an action against the BoR
- * GET /determinations — audit trail of past determinations
+ * POST /scope-query   — Tier 0 (Constitution) + Tier 1 (entity/vivan/platform)
+ * GET  /determinations — audit trail of past determinations
+ *
+ * Contract (MP-17 binding decisions #32–#35):
+ *   Request: {
+ *     ap_ref: string,
+ *     action: string,
+ *     targets?: string[],
+ *     intent?: string,
+ *     tenant_urn: string,                         // required, no default-through
+ *     tenant_type: "enterprise"|"vivan"|"platform",
+ *     persona_urn?: string                        // required when tenant_type === "vivan"
+ *   }
+ *   Response:
+ *     200 {
+ *       ap_ref,
+ *       tier_0: { verdict, matched_rules, reasoning, confidence },
+ *       tier_1: { verdict, matched_rules, reasoning, confidence },
+ *       overall: "ALLOWED" | "DENIED_CONSTITUTIONAL" | "OUT_OF_SCOPE" | "AMBIGUOUS",
+ *       constitution_version,
+ *       timestamp,
+ *       requester,
+ *       escalation_required?: boolean             // set when overall === "AMBIGUOUS"
+ *     }
+ *     400 INVALID_REQUEST  — missing required fields (ap_ref, action, tenant_urn, tenant_type, or persona_urn for vivan)
+ *     503 CONSTITUTION_UNAVAILABLE — Graph read failed at Tier 0
+ *
+ * Tier 0 UNCONSTITUTIONAL produces `overall: "DENIED_CONSTITUTIONAL"` immediately.
+ * Nomos (relay g7c-3) MUST NOT emit a PEM for this outcome — it is absolute denial.
  */
 
 import { Router } from 'express';
 import { requireAuthorizedSource } from '../../lib/access-control.js';
-import { loadBoR } from '../../lib/bor-loader.js';
-import { verifyBorHash } from '../../lib/graph-adapter.js';
+
+const VALID_TENANT_TYPES = new Set(['enterprise', 'vivan', 'platform']);
+
+function aggregate(tier0Verdict, tier1Verdict) {
+  if (tier0Verdict === 'UNCONSTITUTIONAL') return 'DENIED_CONSTITUTIONAL';
+  // Tier 0 = CONSTITUTIONAL or INDETERMINATE → consult Tier 1
+  if (tier1Verdict === 'OUT_OF_SCOPE') return 'OUT_OF_SCOPE';
+  if (tier1Verdict === 'AMBIGUOUS') return 'AMBIGUOUS';
+  if (tier0Verdict === 'INDETERMINATE') return 'AMBIGUOUS'; // ambiguous constitutional check also escalates
+  return 'ALLOWED';
+}
 
 /**
  * @param {object} deps
- * @param {object} deps.config — server config
- * @param {object} deps.determinationStore — in-memory determination store
- * @param {function} deps.evaluateScope — clause matching function (stub until relay a8j-3)
+ * @param {object} deps.governanceLoaders — {loadConstitution, loadEntityBor, loadStatuteEffective}
+ * @param {object} deps.determinationStore
+ * @param {function} deps.matchConstitutional
+ * @param {function} deps.matchScope
  */
-export function createScopeRoutes({ config, determinationStore, evaluateScope }) {
+export function createScopeRoutes({ governanceLoaders, determinationStore, matchConstitutional, matchScope }) {
   const router = Router();
 
-  /**
-   * POST /scope-query
-   *
-   * Input: { ap_ref, action, targets, intent, bor_version? }
-   * Output: { determination, cited_clauses, bor_version, bor_hash, confidence, reasoning, ap_ref, timestamp }
-   *
-   * Flow:
-   *   1. Validate request (ap_ref and action required)
-   *   2. Load BoR document
-   *   3. Verify hash against Graph
-   *   4. Run clause matching (relay a8j-3 — stubbed as AMBIGUOUS here)
-   *   5. Record determination
-   *   6. Return result
-   */
   router.post('/scope-query', requireAuthorizedSource, async (req, res) => {
-    const { ap_ref, action, targets = [], intent = '', bor_version } = req.body;
+    const {
+      ap_ref,
+      action,
+      targets = [],
+      intent = '',
+      tenant_urn,
+      tenant_type,
+      persona_urn,
+    } = req.body || {};
 
-    // Validate required fields
+    // ── Request validation (strict — no default-through per MP-17 guardrail) ──
     if (!ap_ref || !action) {
       return res.status(400).json({
         error: 'INVALID_REQUEST',
         message: 'ap_ref and action are required',
       });
     }
-
-    try {
-      // Load BoR
-      let bor;
-      try {
-        bor = await loadBoR(config.borPath);
-      } catch (err) {
-        return res.status(503).json({
-          error: 'BOR_DOCUMENT_UNAVAILABLE',
-          message: 'Bill of Rights document could not be loaded',
-          detail: err.code === 'ENOENT' ? 'File not found' : err.message,
-          determination: 'AMBIGUOUS',
-          escalation_required: true,
-        });
-      }
-
-      // Verify hash against Graph
-      const verification = await verifyBorHash(config.graphUrl, bor.hash);
-      if (verification.mismatch) {
-        return res.status(409).json({
-          error: 'BOR_VERSION_MISMATCH',
-          message: 'BoR document hash does not match registered version',
-          expected_hash: verification.registered?.hash,
-          actual_hash: bor.hash,
-        });
-      }
-
-      // Version check (if specific version requested)
-      if (bor_version && bor_version !== bor.version) {
-        return res.status(409).json({
-          error: 'BOR_VERSION_MISMATCH',
-          message: `Requested version ${bor_version} does not match current ${bor.version}`,
-        });
-      }
-
-      // Run determination (stub — relay a8j-3 provides real implementation)
-      const result = await evaluateScope({
-        action,
-        targets,
-        intent,
-        bor,
+    if (!tenant_urn || typeof tenant_urn !== 'string') {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: 'tenant_urn is required (MP-17 contract — Thalamus populates at AP drafting)',
       });
+    }
+    if (!tenant_type || !VALID_TENANT_TYPES.has(tenant_type)) {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: `tenant_type is required and must be one of ${[...VALID_TENANT_TYPES].join(', ')}`,
+      });
+    }
+    if (tenant_type === 'vivan' && (!persona_urn || typeof persona_urn !== 'string')) {
+      return res.status(400).json({
+        error: 'INVALID_REQUEST',
+        message: 'persona_urn is required when tenant_type is "vivan"',
+      });
+    }
 
-      // Build determination record
+    // ── Tier 0: Constitutional check (always runs) ──
+    let constitution;
+    try {
+      constitution = await governanceLoaders.loadConstitution();
+    } catch (err) {
+      return res.status(503).json({
+        error: 'CONSTITUTION_UNAVAILABLE',
+        message: 'Constitution could not be loaded from Graph',
+        detail: err.message,
+      });
+    }
+    if (!constitution) {
+      return res.status(503).json({
+        error: 'CONSTITUTION_UNAVAILABLE',
+        message: 'Constitution concept not present in Graph',
+      });
+    }
+
+    const tier0 = await matchConstitutional({
+      action,
+      targets,
+      intent,
+      constitution,
+    });
+
+    // UNCONSTITUTIONAL is absolute per binding decision #34 — short-circuit.
+    if (tier0.verdict === 'UNCONSTITUTIONAL') {
       const determination = {
         ap_ref,
-        determination: result.determination,
-        cited_clauses: result.cited_clauses || [],
-        bor_version: bor.version,
-        bor_hash: bor.hash,
-        confidence: result.confidence || 0,
-        reasoning: result.reasoning || '',
+        tier_0: tier0,
+        tier_1: { verdict: 'N/A', matched_rules: [], reasoning: 'Short-circuited by Tier 0 UNCONSTITUTIONAL.', confidence: 0 },
+        overall: 'DENIED_CONSTITUTIONAL',
+        constitution_version: constitution.version,
+        tenant_urn,
+        tenant_type,
         timestamp: new Date().toISOString(),
         requester: req.sourceOrgan,
       };
-
-      // Add escalation flag for AMBIGUOUS
-      if (determination.determination === 'AMBIGUOUS') {
-        determination.escalation_required = true;
-      }
-
-      // Record
       determinationStore.add(determination);
+      return res.json(determination);
+    }
 
-      res.json(determination);
+    // ── Tier 1: entity / vivan / platform scope check ──
+    let tier1;
+    try {
+      if (tenant_type === 'platform') {
+        // Platform-scoped APMs have no entity governance above the Constitution.
+        // Tier 1 auto-passes; Tier 0 verdict carries through aggregation.
+        tier1 = {
+          verdict: 'IN_SCOPE',
+          matched_rules: [],
+          reasoning: 'Tenant type is platform — no entity governance above Constitution.',
+          confidence: 1,
+        };
+      } else if (tenant_type === 'enterprise') {
+        const entityBor = await governanceLoaders.loadEntityBor(tenant_urn);
+        tier1 = await matchScope({ action, targets, intent, governance: entityBor });
+      } else {
+        // tenant_type === 'vivan'
+        const effective = await governanceLoaders.loadStatuteEffective(persona_urn);
+        // Convert resolved cascade to the BoR doc shape the matcher expects.
+        // layersApplied order is general→specific; the last layer's payload wins per mergeChain,
+        // but the matcher evaluates the EFFECTIVE flat map, not each layer. We present the
+        // merged constraints as a single pseudo-article so the matcher can reason textually.
+        const effectiveDoc = effectiveGovernanceToBorDocShape(effective);
+        tier1 = await matchScope({ action, targets, intent, governance: effectiveDoc });
+      }
     } catch (err) {
-      res.status(500).json({
-        error: 'INTERNAL_ERROR',
-        message: err.message,
+      return res.status(503).json({
+        error: 'TIER1_GOVERNANCE_UNAVAILABLE',
+        message: 'Tier 1 governance document could not be resolved',
+        detail: err.message,
       });
     }
+
+    const overall = aggregate(tier0.verdict, tier1.verdict);
+    const determination = {
+      ap_ref,
+      tier_0: tier0,
+      tier_1: tier1,
+      overall,
+      constitution_version: constitution.version,
+      tenant_urn,
+      tenant_type,
+      timestamp: new Date().toISOString(),
+      requester: req.sourceOrgan,
+    };
+    if (overall === 'AMBIGUOUS') {
+      determination.escalation_required = true;
+    }
+    determinationStore.add(determination);
+    return res.json(determination);
   });
 
-  /**
-   * GET /determinations
-   *
-   * Query params: ap_ref, determination, since (ISO8601), limit (default 50)
-   */
   router.get('/determinations', async (req, res) => {
     const { ap_ref, determination, since, limit } = req.query;
     const result = determinationStore.query({
@@ -133,4 +199,45 @@ export function createScopeRoutes({ config, determinationStore, evaluateScope })
   });
 
   return router;
+}
+
+/**
+ * Adapter: resolved statute cascade → BoR doc shape expected by matchScope.
+ *
+ * The cascade produces a flat effective-governance field map plus layer metadata.
+ * The clause-matcher expects articles/clauses. We render the layered cascade as
+ * pseudo-articles, one per applied layer, with the layer's contributing constraints
+ * as textual content. This preserves the clause-matcher's existing LLM contract
+ * while giving it the cascade's structure.
+ */
+export function effectiveGovernanceToBorDocShape(cascade) {
+  if (!cascade) {
+    return null;
+  }
+  const { effectiveGovernance = {}, layersApplied = [], constitutionFieldsLocked = [] } = cascade;
+  const layerArticles = layersApplied.map((l) => ({
+    id: l.layer,
+    title: `Layer: ${l.layer}`,
+    clauses: [],
+    text: `URN: ${l.urn}`,
+  }));
+  const effectiveText = Object.keys(effectiveGovernance).length === 0
+    ? '(no effective constraints — Vivan falls directly under Constitution)'
+    : Object.entries(effectiveGovernance)
+      .map(([k, v]) => `- ${k}: ${JSON.stringify(v)}${constitutionFieldsLocked.includes(k) ? ' [constitutional-lock]' : ''}`)
+      .join('\n');
+  layerArticles.push({
+    id: 'effective',
+    title: 'Effective Governance (merged)',
+    clauses: [],
+    text: effectiveText,
+  });
+  return {
+    version: `cascade:${layersApplied.map((l) => l.layer).join('>')}`,
+    articles: layerArticles,
+    clauseCount: 0,
+    raw: layerArticles.map((a) => `## ${a.title}\n${a.text}`).join('\n\n'),
+    constraints: effectiveGovernance,
+    constitutionFieldsLocked,
+  };
 }
